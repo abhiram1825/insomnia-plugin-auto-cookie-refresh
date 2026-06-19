@@ -1,8 +1,17 @@
 const inFlightRetries = new Set();
 const requestCache = new Map();
 
-function isLoginUrl(url = '') {
-  return url.toLowerCase().includes('/login');
+function isLoginUrl(url = '', loginPath = '/login') {
+  return url.toLowerCase().includes(loginPath.toLowerCase());
+}
+
+function normalizePath(path = '/login') {
+  if (!path) return '/login';
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+function joinUrl(baseUrl, path) {
+  return `${baseUrl.replace(/\/$/, '')}${normalizePath(path)}`;
 }
 
 function jsonBody(payload) {
@@ -19,28 +28,38 @@ function getEnvValue(context, key) {
     return null;
   }
 
-  return String(value).trim();
+  const stringValue = String(value).trim();
+
+  return stringValue.length ? stringValue : null;
 }
 
 function getAuthConfig(context) {
   return {
     baseUrl: getEnvValue(context, 'baseURL'),
+    loginPath: getEnvValue(context, 'loginPath') || '/login',
     username: getEnvValue(context, 'username'),
-    password: getEnvValue(context, 'password')
+    password: getEnvValue(context, 'password'),
+    usernameField: getEnvValue(context, 'usernameField') || 'username',
+    passwordField: getEnvValue(context, 'passwordField') || 'password'
   };
 }
 
-function buildLoginRequest(baseUrl, username, password) {
+function buildLoginRequest(config) {
+  const payload = {
+    [config.usernameField]: config.username,
+    [config.passwordField]: config.password
+  };
+
   return {
     _id: `auto-login-${Date.now()}`,
     name: 'Auto Login',
     method: 'POST',
-    url: `${baseUrl.replace(/\/$/, '')}/api/auth/login`,
+    url: joinUrl(config.baseUrl, config.loginPath),
     headers: [
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Accept', value: 'application/json' }
     ],
-    body: jsonBody({ username, password }),
+    body: jsonBody(payload),
     settingSendCookies: true,
     settingStoreCookies: true
   };
@@ -59,6 +78,28 @@ function cloneRequestFromContext(req) {
     settingSendCookies: true,
     settingStoreCookies: true
   };
+}
+
+function getStatusCode(response) {
+  if (typeof response.getStatusCode === 'function') {
+    return response.getStatusCode();
+  }
+
+  return response.statusCode;
+}
+
+function getResponseBody(response) {
+  if (typeof response.getBody === 'function') {
+    return response.getBody();
+  }
+
+  return response.body;
+}
+
+function setJsonResponse(context, payload) {
+  context.response.setBody(
+    Buffer.from(JSON.stringify(payload, null, 2), 'utf8')
+  );
 }
 
 module.exports.requestHooks = [
@@ -83,66 +124,38 @@ module.exports.responseHooks = [
     if (!cached) return;
 
     const originalRequest = cached.request;
+    const config = getAuthConfig(context);
 
-    if (isLoginUrl(originalRequest.url)) return;
+    if (isLoginUrl(originalRequest.url, config.loginPath)) return;
     if (inFlightRetries.has(requestId)) return;
 
     inFlightRetries.add(requestId);
 
     try {
-      const { baseUrl, username, password } = getAuthConfig(context);
-
-      if (!baseUrl || !username || !password) {
-        context.response.setBody(
-          Buffer.from(
-            JSON.stringify(
-              {
-                error: 'Auto login failed',
-                message:
-                  'Missing baseURL, username, or password in environment.'
-              },
-              null,
-              2
-            ),
-            'utf8'
-          )
-        );
+      if (!config.baseUrl || !config.username || !config.password) {
+        setJsonResponse(context, {
+          error: 'Auto login failed',
+          message:
+            'Missing baseURL, username, or password in Insomnia environment.'
+        });
         return;
       }
 
-      const loginRequest = buildLoginRequest(baseUrl, username, password);
-
+      const loginRequest = buildLoginRequest(config);
       const loginResponse = await context.network.sendRequest(loginRequest);
-
-      const loginStatusCode =
-        typeof loginResponse.getStatusCode === 'function'
-          ? loginResponse.getStatusCode()
-          : loginResponse.statusCode;
+      const loginStatusCode = getStatusCode(loginResponse);
 
       if (loginStatusCode < 200 || loginStatusCode >= 300) {
-        context.response.setBody(
-          Buffer.from(
-            JSON.stringify(
-              {
-                error: 'Auto login failed',
-                loginStatusCode
-              },
-              null,
-              2
-            ),
-            'utf8'
-          )
-        );
+        setJsonResponse(context, {
+          error: 'Auto login failed',
+          loginStatusCode
+        });
         return;
       }
 
       // Retry happens here after login updates Insomnia's cookie jar.
       const retriedResponse = await context.network.sendRequest(originalRequest);
-
-      const retriedBody =
-        typeof retriedResponse.getBody === 'function'
-          ? retriedResponse.getBody()
-          : retriedResponse.body;
+      const retriedBody = getResponseBody(retriedResponse);
 
       if (retriedBody) {
         context.response.setBody(
@@ -152,19 +165,10 @@ module.exports.responseHooks = [
         );
       }
     } catch (error) {
-      context.response.setBody(
-        Buffer.from(
-          JSON.stringify(
-            {
-              error: 'Auto refresh plugin failed',
-              message: error.message
-            },
-            null,
-            2
-          ),
-          'utf8'
-        )
-      );
+      setJsonResponse(context, {
+        error: 'Auto refresh plugin failed',
+        message: error.message
+      });
     } finally {
       inFlightRetries.delete(requestId);
     }
