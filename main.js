@@ -12,16 +12,21 @@ function jsonBody(payload) {
   };
 }
 
-async function getEnvValue(context, key) {
-  const value = await context.app.renderTemplate(`{{ _.${key} }}`);
-  return value && value.trim() ? value.trim() : null;
+function getEnvValue(context, key) {
+  const value = context.request.getEnvironmentVariable(key);
+
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  return String(value).trim();
 }
 
-async function getAuthConfig(context) {
+function getAuthConfig(context) {
   return {
-    baseUrl: await getEnvValue(context, 'baseURL'),
-    username: await getEnvValue(context, 'username'),
-    password: await getEnvValue(context, 'password')
+    baseUrl: getEnvValue(context, 'baseURL'),
+    username: getEnvValue(context, 'username'),
+    password: getEnvValue(context, 'password')
   };
 }
 
@@ -57,7 +62,7 @@ function cloneRequestFromContext(req) {
 }
 
 module.exports.requestHooks = [
-  async context => {
+  context => {
     const req = context.request;
 
     requestCache.set(req.getId(), {
@@ -85,7 +90,7 @@ module.exports.responseHooks = [
     inFlightRetries.add(requestId);
 
     try {
-      const { baseUrl, username, password } = await getAuthConfig(context);
+      const { baseUrl, username, password } = getAuthConfig(context);
 
       if (!baseUrl || !username || !password) {
         context.response.setBody(
@@ -94,7 +99,7 @@ module.exports.responseHooks = [
               {
                 error: 'Auto login failed',
                 message:
-                  'Missing baseURL, username, or password in project/collection environment.'
+                  'Missing baseURL, username, or password in environment.'
               },
               null,
               2
@@ -109,13 +114,18 @@ module.exports.responseHooks = [
 
       const loginResponse = await context.network.sendRequest(loginRequest);
 
-      if (loginResponse.statusCode < 200 || loginResponse.statusCode >= 300) {
+      const loginStatusCode =
+        typeof loginResponse.getStatusCode === 'function'
+          ? loginResponse.getStatusCode()
+          : loginResponse.statusCode;
+
+      if (loginStatusCode < 200 || loginStatusCode >= 300) {
         context.response.setBody(
           Buffer.from(
             JSON.stringify(
               {
                 error: 'Auto login failed',
-                loginStatusCode: loginResponse.statusCode
+                loginStatusCode
               },
               null,
               2

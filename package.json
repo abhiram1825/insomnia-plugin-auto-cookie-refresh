@@ -1,6 +1,6 @@
 {
   "name": "insomnia-plugin-auto-cookie-refresh",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Automatically logs in and retries requests after 401 responses.",
   "main": "main.js",
   "insomnia": {
