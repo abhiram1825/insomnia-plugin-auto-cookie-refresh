@@ -1,10 +1,20 @@
 {
   "name": "insomnia-plugin-auto-cookie-refresh",
-  "version": "0.0.1",
-  "private": true,
+  "version": "1.0.0",
+  "description": "Automatically logs in and retries requests after 401 responses.",
+  "main": "main.js",
   "insomnia": {
     "name": "auto-cookie-refresh",
-    "description": ""
+    "displayName": "Auto Cookie Refresh"
   },
-  "main": "main.js"
+  "keywords": [
+    "insomnia",
+    "plugin",
+    "cookie",
+    "auth",
+    "refresh",
+    "login"
+  ],
+  "author": "Abhi Ram",
+  "license": "MIT"
 }
