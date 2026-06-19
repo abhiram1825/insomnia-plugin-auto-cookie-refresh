@@ -1,0 +1,10 @@
+{
+  "name": "insomnia-plugin-auto-cookie-refresh",
+  "version": "0.0.1",
+  "private": true,
+  "insomnia": {
+    "name": "auto-cookie-refresh",
+    "description": ""
+  },
+  "main": "main.js"
+}
