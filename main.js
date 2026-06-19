@@ -35,7 +35,7 @@ function buildLoginRequest(baseUrl, username, password) {
     _id: `auto-login-${Date.now()}`,
     name: 'Auto Login',
     method: 'POST',
-    url: `${baseUrl.replace(/\/$/, '')}/login`,
+    url: `${baseUrl.replace(/\/$/, '')}/api/auth/login`,
     headers: [
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Accept', value: 'application/json' }
