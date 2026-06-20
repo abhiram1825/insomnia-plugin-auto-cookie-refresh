@@ -1,8 +1,13 @@
 {
   "name": "insomnia-plugin-auto-cookie-refresh",
-  "version": "1.0.10",
+  "version": "1.0.12",
   "description": "Automatically logs in and injects a refreshed authentication cookie.",
   "main": "main.js",
+  "files": [
+    "main.js",
+    "README.md",
+    "LICENSE"
+  ],
   "insomnia": {
     "name": "auto-cookie-refresh",
     "displayName": "Auto Cookie Refresh",
@@ -10,6 +15,7 @@
   },
   "keywords": [
     "insomnia",
+    "insomnia-plugin",
     "plugin",
     "cookie",
     "auth",
@@ -17,5 +23,8 @@
     "login"
   ],
   "author": "Abhi Ram",
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }

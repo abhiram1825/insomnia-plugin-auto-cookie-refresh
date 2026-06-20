@@ -85,13 +85,13 @@ function extractVariableName(value) {
   }
 
   var text = value.trim();
-  var match = text.match(/^_\.([A-Za-z0-9_.-]+)$/);
+  var match = text.match(/^_+\.([A-Za-z0-9_.-]+)$/);
 
   if (match) {
     return match[1];
   }
 
-  match = text.match(/^\{\{\s*_\.([A-Za-z0-9_.-]+)\s*\}\}$/);
+  match = text.match(/^\{\{\s*_+\.([A-Za-z0-9_.-]+)\s*\}\}$/);
 
   if (match) {
     return match[1];
@@ -104,6 +104,27 @@ function extractVariableName(value) {
   }
 
   return null;
+}
+
+function getKnownEnvironment(context) {
+  var request = getContextRequest(context);
+  var environment;
+
+  if (request && typeof request.getEnvironment === 'function') {
+    environment = request.getEnvironment();
+
+    if (environment) {
+      return environment;
+    }
+  }
+
+  environment = findValueByKey(context, 'environment', 6, []);
+
+  if (environment) {
+    return environment;
+  }
+
+  return findValueByKey(context, 'env', 6, []);
 }
 
 function getNestedValue(object, path) {
@@ -124,35 +145,95 @@ function getNestedValue(object, path) {
   }, object);
 }
 
+function isSearchableObject(value) {
+  return value &&
+    typeof value === 'object' &&
+    !(typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) &&
+    !(value instanceof Date);
+}
+
+function findValueByKey(object, key, depth, seen) {
+  var keys;
+  var index;
+  var currentKey;
+  var value;
+  var found;
+
+  if (!isSearchableObject(object) || !key || depth < 0) {
+    return undefined;
+  }
+
+  if (seen.indexOf(object) >= 0) {
+    return undefined;
+  }
+
+  seen.push(object);
+  value = getNestedValue(object, key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  keys = Object.keys(object);
+
+  for (index = 0; index < keys.length; index += 1) {
+    currentKey = keys[index];
+
+    if (currentKey === key) {
+      return object[currentKey];
+    }
+  }
+
+  for (index = 0; index < keys.length; index += 1) {
+    currentKey = keys[index];
+    value = object[currentKey];
+
+    if (typeof value === 'function') {
+      continue;
+    }
+
+    found = findValueByKey(value, key, depth - 1, seen);
+
+    if (found !== undefined) {
+      return found;
+    }
+  }
+
+  return undefined;
+}
+
 function resolveArgument(context, value) {
   var variableName = extractVariableName(value);
   var request = getContextRequest(context);
   var environment;
   var resolvedValue;
 
+  if (request && typeof request.getEnvironmentVariable === 'function') {
+    resolvedValue = request.getEnvironmentVariable(variableName || value);
+
+    if (resolvedValue !== undefined) {
+      return resolvedValue;
+    }
+  }
+
+  environment = getKnownEnvironment(context);
+
+  if (environment) {
+    resolvedValue = getNestedValue(environment, variableName || value);
+
+    if (resolvedValue !== undefined) {
+      return resolvedValue;
+    }
+  }
+
   if (!variableName) {
     return value;
   }
 
-  if (!request) {
-    return undefined;
-  }
+  resolvedValue = findValueByKey(context, variableName, 6, []);
 
-  if (typeof request.getEnvironmentVariable === 'function') {
-    resolvedValue = request.getEnvironmentVariable(variableName);
-
-    if (resolvedValue !== undefined) {
-      return resolvedValue;
-    }
-  }
-
-  if (typeof request.getEnvironment === 'function') {
-    environment = request.getEnvironment();
-    resolvedValue = getNestedValue(environment, variableName);
-
-    if (resolvedValue !== undefined) {
-      return resolvedValue;
-    }
+  if (resolvedValue !== undefined) {
+    return resolvedValue;
   }
 
   return undefined;
@@ -558,6 +639,16 @@ async function runAutoAuthCookie(
       config.loginUrl +
       '; Cookie Name=' +
       config.cookieName +
+      '; Username=' +
+      config.username +
+      '; Password Length=' +
+      String(config.password).length +
+      '; Username Field=' +
+      config.usernameField +
+      '; Password Field=' +
+      config.passwordField +
+      '; Content Type=' +
+      config.contentType +
       '; Cause=' +
       (error && error.message ? error.message : String(error));
   }
