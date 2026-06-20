@@ -63,13 +63,15 @@ http://localhost:8080/api/auth/login
 - Reads the configured cookie from the `Set-Cookie` response header.
 - Caches the cookie value using the cookie expiry, with a fallback TTL.
 - Reuses the cached cookie until it is close to expiring.
+- Refreshes after 12 minutes at most, even if the cookie expiry is longer.
+- Clears this plugin's cached cookies when a protected request returns `401`.
 - Returns only the cookie value, so the request header can provide the cookie name.
 
 If login fails, the tag returns a diagnostic value beginning with `AUTO_AUTH_COOKIE_ERROR:` so the failed request log shows the actual login URL, cookie name, content type, and server response.
 
 ## Notes
 
-This plugin performs login before the protected request is sent. It does not intercept a completed `401` response and replay the same request.
+This plugin performs login before the protected request is sent. When a request returns `401`, the plugin clears its cached cookie so the next request logs in again. It does not replay the failed request automatically.
 
 ## License
 

@@ -1,4 +1,5 @@
 var CACHE_PREFIX = 'auto-auth-cookie:v5:';
+var CACHE_INDEX_KEY = CACHE_PREFIX + 'index';
 
 var DEFAULTS = {
   loginPath: 'api/auth/login',
@@ -7,8 +8,8 @@ var DEFAULTS = {
   passwordField: 'password',
   contentType: 'application/json',
   fallbackTtlSeconds: 900,
-  expiryBufferSeconds: 30,
-  maxReuseSeconds: 120,
+  expiryBufferSeconds: 60,
+  maxReuseSeconds: 720,
   timeoutMs: 10000
 };
 
@@ -486,6 +487,52 @@ async function readCache(context, cacheKey) {
 
 async function saveCache(context, cacheKey, cache) {
   await getUsableStore(context).setItem(cacheKey, JSON.stringify(cache));
+  await rememberCacheKey(context, cacheKey);
+}
+
+async function readCacheIndex(context) {
+  var store = getUsableStore(context);
+  var rawIndex = await store.getItem(CACHE_INDEX_KEY);
+
+  if (!rawIndex) {
+    return [];
+  }
+
+  try {
+    return JSON.parse(rawIndex);
+  } catch (error) {
+    await store.removeItem(CACHE_INDEX_KEY);
+    return [];
+  }
+}
+
+async function rememberCacheKey(context, cacheKey) {
+  var store = getUsableStore(context);
+  var cacheKeys = await readCacheIndex(context);
+
+  if (cacheKeys.indexOf(cacheKey) < 0) {
+    cacheKeys.push(cacheKey);
+    await store.setItem(CACHE_INDEX_KEY, JSON.stringify(cacheKeys));
+  }
+}
+
+async function clearAllCachedCookies(context) {
+  var store = getUsableStore(context);
+  var cacheKeys = await readCacheIndex(context);
+  var key;
+
+  while (cacheKeys.length > 0) {
+    key = cacheKeys.pop();
+    await store.removeItem(key);
+  }
+
+  await store.removeItem(CACHE_INDEX_KEY);
+
+  Object.keys(memoryStore).forEach(function (memoryKey) {
+    if (memoryKey.indexOf(CACHE_PREFIX) === 0) {
+      delete memoryStore[memoryKey];
+    }
+  });
 }
 
 async function performLogin(context, cacheKey, config) {
@@ -720,4 +767,37 @@ module.exports.templateTags = [
     ],
     run: runAutoAuthCookie
   }
+];
+
+function getResponseStatusCode(context) {
+  var response = context && context.response ? context.response : null;
+  var statusCode;
+
+  if (!response) {
+    return 0;
+  }
+
+  if (typeof response.getStatusCode === 'function') {
+    statusCode = response.getStatusCode();
+  } else if (typeof response.getStatus === 'function') {
+    statusCode = response.getStatus();
+  } else if (response.statusCode !== undefined) {
+    statusCode = response.statusCode;
+  } else if (response.status !== undefined) {
+    statusCode = response.status;
+  }
+
+  return Number(statusCode) || 0;
+}
+
+async function clearAutoAuthCacheOnUnauthorized(context) {
+  if (getResponseStatusCode(context) !== 401) {
+    return;
+  }
+
+  await clearAllCachedCookies(context);
+}
+
+module.exports.responseHooks = [
+  clearAutoAuthCacheOnUnauthorized
 ];
