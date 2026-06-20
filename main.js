@@ -1,541 +1,632 @@
-const PLUGIN_NAME = 'Auto Auth Cookie';
-const refreshPromises = new Map();
+var CACHE_PREFIX = 'auto-auth-cookie:v5:';
 
-function delay(milliseconds) {
-  return new Promise(resolve => setTimeout(resolve, milliseconds));
+var DEFAULTS = {
+  loginPath: 'api/auth/login',
+  cookieName: 'authToken',
+  usernameField: 'username',
+  passwordField: 'password',
+  contentType: 'application/json',
+  fallbackTtlSeconds: 900,
+  expiryBufferSeconds: 30,
+  maxReuseSeconds: 120,
+  timeoutMs: 10000
+};
+
+var refreshPromises = {};
+var memoryStore = {};
+
+function hasValue(value) {
+  return value !== undefined &&
+    value !== null &&
+    String(value).trim() !== '';
 }
 
-function normalizeDomain(value = '') {
-  let domain = String(value).trim().toLowerCase();
+function getContextRequest(context) {
+  return context && context.request ? context.request : null;
+}
 
-  if (!domain) {
-    return '';
+function getContextStore(context) {
+  return context && context.store ? context.store : null;
+}
+
+function createMemoryStore() {
+  return {
+    getItem: async function (key) {
+      return Object.prototype.hasOwnProperty.call(memoryStore, key)
+        ? memoryStore[key]
+        : null;
+    },
+    setItem: async function (key, value) {
+      memoryStore[key] = value;
+    },
+    removeItem: async function (key) {
+      delete memoryStore[key];
+    }
+  };
+}
+
+function getUsableStore(context) {
+  var store = getContextStore(context);
+
+  if (
+    store &&
+    typeof store.getItem === 'function' &&
+    typeof store.setItem === 'function' &&
+    typeof store.removeItem === 'function'
+  ) {
+    return store;
+  }
+
+  return createMemoryStore();
+}
+
+function getMethodValue(object, methodName) {
+  if (!object || typeof object[methodName] !== 'function') {
+    return undefined;
   }
 
   try {
-    if (domain.includes('://')) {
-      domain = new URL(domain).hostname;
-    }
-  } catch {
-    // Keep the provided value.
+    return object[methodName]();
+  } catch (error) {
+    return undefined;
   }
-
-  return domain
-    .replace(/^\./, '')
-    .replace(/:\d+$/, '');
 }
 
-function domainMatches(cookieDomain, configuredDomain) {
-  const cookieHost = normalizeDomain(cookieDomain);
-  const targetHost = normalizeDomain(configuredDomain);
+function getAppVersion(context) {
+  var app = context && context.app ? context.app : null;
+  var info = getMethodValue(app, 'getInfo');
 
-  if (!cookieHost || !targetHost) {
-    return false;
-  }
-
-  return (
-    targetHost === cookieHost ||
-    targetHost.endsWith(`.${cookieHost}`) ||
-    cookieHost.endsWith(`.${targetHost}`)
-  );
+  return info && info.version ? String(info.version) : '';
 }
 
-function decodeBase64Url(value) {
-  const normalized = String(value)
-    .replace(/-/g, '+')
-    .replace(/_/g, '/');
-
-  const padded = normalized.padEnd(
-    normalized.length + ((4 - (normalized.length % 4)) % 4),
-    '='
-  );
-
-  return Buffer.from(padded, 'base64').toString('utf8');
-}
-
-function extractJwt(cookieValue) {
-  if (!cookieValue) {
+function extractVariableName(value) {
+  if (typeof value !== 'string') {
     return null;
   }
 
-  let value = String(cookieValue);
+  var text = value.trim();
+  var match = text.match(/^_\.([A-Za-z0-9_.-]+)$/);
 
-  try {
-    value = decodeURIComponent(value);
-  } catch {
-    // Keep the original cookie value.
+  if (match) {
+    return match[1];
   }
 
-  if (value.split('.').length === 3) {
-    return value;
+  match = text.match(/^\{\{\s*_\.([A-Za-z0-9_.-]+)\s*\}\}$/);
+
+  if (match) {
+    return match[1];
   }
 
-  try {
-    const parsed = JSON.parse(value);
+  match = text.match(/^\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}$/);
 
-    const token =
-      parsed.access_token ||
-      parsed.accessToken ||
-      parsed.authToken ||
-      parsed.token;
-
-    return typeof token === 'string' ? token : null;
-  } catch {
-    return null;
-  }
-}
-
-function getJwtExpiry(cookieValue) {
-  const jwt = extractJwt(cookieValue);
-
-  if (!jwt) {
-    return null;
-  }
-
-  try {
-    const payloadPart = jwt.split('.')[1];
-    const payload = JSON.parse(decodeBase64Url(payloadPart));
-
-    if (!payload.exp) {
-      return null;
-    }
-
-    return Number(payload.exp) * 1000;
-  } catch {
-    return null;
-  }
-}
-
-function getCookieExpiry(cookie) {
-  if (!cookie) {
-    return null;
-  }
-
-  const expiryCandidates = [];
-
-  if (cookie.expires) {
-    const cookieExpiry = Date.parse(cookie.expires);
-
-    if (!Number.isNaN(cookieExpiry)) {
-      expiryCandidates.push(cookieExpiry);
-    }
-  }
-
-  const jwtExpiry = getJwtExpiry(cookie.value);
-
-  if (jwtExpiry) {
-    expiryCandidates.push(jwtExpiry);
-  }
-
-  if (!expiryCandidates.length) {
-    // A session cookie without an explicit expiry is considered valid
-    // while it remains present in Insomnia's cookie jar.
-    return null;
-  }
-
-  return Math.min(...expiryCandidates);
-}
-
-function isCookieFresh(cookie, expiryBufferSeconds) {
-  if (!cookie || !cookie.value) {
-    return false;
-  }
-
-  const expiresAt = getCookieExpiry(cookie);
-
-  if (!expiresAt) {
-    return true;
-  }
-
-  const bufferMilliseconds =
-    Math.max(0, Number(expiryBufferSeconds) || 0) * 1000;
-
-  return Date.now() + bufferMilliseconds < expiresAt;
-}
-
-function getResponseStatusCode(response) {
-  if (!response) {
-    return 0;
-  }
-
-  if (typeof response.getStatusCode === 'function') {
-    return Number(response.getStatusCode());
-  }
-
-  return Number(
-    response.statusCode ??
-    response.status ??
-    response.code ??
-    0
-  );
-}
-
-async function showDebugAlert(context, enabled, title, message) {
-  if (!enabled || !context.app?.alert) {
-    return;
-  }
-
-  await context.app.alert(title, message);
-}
-
-function validateContext(context) {
-  if (!context?.util?.models?.request) {
-    throw new Error(
-      'This Insomnia version does not expose request models to template tags.'
-    );
-  }
-
-  if (!context?.util?.models?.workspace) {
-    throw new Error(
-      'This Insomnia version does not expose workspace models to template tags.'
-    );
-  }
-
-  if (!context?.util?.models?.cookieJar) {
-    throw new Error(
-      'This Insomnia version does not expose the native cookie jar to template tags.'
-    );
-  }
-
-  if (!context?.network?.sendRequest) {
-    throw new Error(
-      'This Insomnia version does not expose network.sendRequest to template tags.'
-    );
-  }
-
-  if (!context?.meta?.workspaceId) {
-    throw new Error(
-      'Could not determine the current Insomnia workspace.'
-    );
-  }
-}
-
-async function getCookieJar(context) {
-  const workspace =
-    await context.util.models.workspace.getById(
-      context.meta.workspaceId
-    );
-
-  if (!workspace) {
-    throw new Error(
-      `Workspace not found: ${context.meta.workspaceId}`
-    );
-  }
-
-  return context.util.models.cookieJar.getOrCreateForWorkspace(
-    workspace
-  );
-}
-
-async function findCookie(
-  context,
-  configuredDomain,
-  cookieName
-) {
-  const cookieJar = await getCookieJar(context);
-  const cookies = Array.isArray(cookieJar.cookies)
-    ? cookieJar.cookies
-    : [];
-
-  const matchingCookies = cookies.filter(cookie => {
-    return (
-      cookie?.key === cookieName &&
-      domainMatches(cookie.domain, configuredDomain)
-    );
-  });
-
-  if (!matchingCookies.length) {
-    return null;
-  }
-
-  /*
-   * Prefer the cookie with the latest expiry when duplicate cookies
-   * exist for the same domain and name.
-   */
-  matchingCookies.sort((first, second) => {
-    const firstExpiry = getCookieExpiry(first) || Infinity;
-    const secondExpiry = getCookieExpiry(second) || Infinity;
-
-    return secondExpiry - firstExpiry;
-  });
-
-  return matchingCookies[0];
-}
-
-async function waitForFreshCookie(
-  context,
-  configuredDomain,
-  cookieName,
-  expiryBufferSeconds
-) {
-  const attempts = 15;
-  const waitMilliseconds = 100;
-
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const cookie = await findCookie(
-      context,
-      configuredDomain,
-      cookieName
-    );
-
-    if (isCookieFresh(cookie, expiryBufferSeconds)) {
-      return cookie;
-    }
-
-    await delay(waitMilliseconds);
+  if (match) {
+    return match[1];
   }
 
   return null;
 }
 
-async function loadLoginRequest(context, loginRequestId) {
-  const request =
-    await context.util.models.request.getById(
-      loginRequestId
-    );
+function getNestedValue(object, path) {
+  if (!object || !path) {
+    return undefined;
+  }
+
+  return path.split('.').reduce(function (current, part) {
+    if (
+      current === undefined ||
+      current === null ||
+      typeof current !== 'object'
+    ) {
+      return undefined;
+    }
+
+    return current[part];
+  }, object);
+}
+
+function resolveArgument(context, value) {
+  var variableName = extractVariableName(value);
+  var request = getContextRequest(context);
+  var environment;
+  var resolvedValue;
+
+  if (!variableName) {
+    return value;
+  }
 
   if (!request) {
-    throw new Error(
-      `Could not find the selected login request: ${loginRequestId}`
-    );
+    return undefined;
   }
 
-  /*
-   * Ensure this execution can send and store cookies.
-   * These values are applied to the request model passed to Insomnia.
-   */
-  request.settingSendCookies = true;
-  request.settingStoreCookies = true;
+  if (typeof request.getEnvironmentVariable === 'function') {
+    resolvedValue = request.getEnvironmentVariable(variableName);
 
-  return request;
+    if (resolvedValue !== undefined) {
+      return resolvedValue;
+    }
+  }
+
+  if (typeof request.getEnvironment === 'function') {
+    environment = request.getEnvironment();
+    resolvedValue = getNestedValue(environment, variableName);
+
+    if (resolvedValue !== undefined) {
+      return resolvedValue;
+    }
+  }
+
+  return undefined;
 }
 
-async function performLogin(
-  context,
-  loginRequestId,
-  configuredDomain,
-  cookieName,
-  expiryBufferSeconds,
-  debugAlerts
-) {
-  const loginRequest = await loadLoginRequest(
-    context,
-    loginRequestId
-  );
+function joinUrl(baseUrl, path) {
+  var normalizedBaseUrl = String(baseUrl || '').trim();
+  var normalizedPath = String(path || '').trim();
 
-  const currentRequestId =
-    context.meta?.requestId ||
-    context.meta?.request?.id ||
-    null;
+  if (!normalizedBaseUrl) {
+    throw new Error('Base URL is empty.');
+  }
 
-  if (currentRequestId === loginRequestId) {
+  if (!/^https?:\/\//i.test(normalizedBaseUrl)) {
     throw new Error(
-      'The Auto Auth Cookie template tag cannot be used inside the login request itself.'
+      'Base URL must begin with http:// or https://. Resolved value: "' +
+      normalizedBaseUrl +
+      '"'
     );
   }
 
-  /*
-   * Two attempts handle the original race condition where Insomnia may
-   * remove the expired cookie while the first new cookie is being stored.
-   */
-  const maximumLoginAttempts = 2;
-
-  for (
-    let attempt = 1;
-    attempt <= maximumLoginAttempts;
-    attempt += 1
-  ) {
-    await showDebugAlert(
-      context,
-      debugAlerts,
-      PLUGIN_NAME,
-      `Sending login request "${loginRequest.name}" — attempt ${attempt}.`
-    );
-
-    const response =
-      await context.network.sendRequest(loginRequest);
-
-    const statusCode = getResponseStatusCode(response);
-
-    if (statusCode < 200 || statusCode >= 300) {
-      throw new Error(
-        `Login request "${loginRequest.name}" failed with HTTP ${statusCode || 'unknown'}.`
-      );
-    }
-
-    const freshCookie = await waitForFreshCookie(
-      context,
-      configuredDomain,
-      cookieName,
-      expiryBufferSeconds
-    );
-
-    if (freshCookie) {
-      await showDebugAlert(
-        context,
-        debugAlerts,
-        PLUGIN_NAME,
-        `Login succeeded. Cookie "${cookieName}" is now available for "${configuredDomain}".`
-      );
-
-      return freshCookie;
-    }
-
-    if (attempt < maximumLoginAttempts) {
-      await delay(200);
-    }
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    return normalizedPath;
   }
 
-  throw new Error(
-    `Login returned successfully, but a fresh "${cookieName}" cookie was not found in Insomnia's cookie jar for "${configuredDomain}".`
-  );
+  return normalizedBaseUrl.replace(/\/+$/, '') +
+    '/' +
+    normalizedPath.replace(/^\/+/, '');
 }
 
-async function getOrRefreshCookie(
-  context,
-  loginRequestId,
-  configuredDomain,
-  cookieName,
-  expiryBufferSeconds,
-  debugAlerts
-) {
-  const existingCookie = await findCookie(
-    context,
-    configuredDomain,
-    cookieName
-  );
-
-  if (
-    isCookieFresh(
-      existingCookie,
-      expiryBufferSeconds
-    )
-  ) {
-    return existingCookie;
+function getNodeClient(protocol) {
+  if (protocol === 'https:') {
+    return require('https');
   }
 
-  const refreshKey = [
-    context.meta.workspaceId,
-    loginRequestId,
-    normalizeDomain(configuredDomain),
-    cookieName
-  ].join(':');
+  return require('http');
+}
 
-  if (!refreshPromises.has(refreshKey)) {
-    const refreshPromise = performLogin(
-      context,
-      loginRequestId,
-      configuredDomain,
-      cookieName,
-      expiryBufferSeconds,
-      debugAlerts
-    ).finally(() => {
-      refreshPromises.delete(refreshKey);
+function requestRaw(url, options, body) {
+  return new Promise(function (resolve, reject) {
+    var parsedUrl;
+    var client;
+    var request;
+
+    try {
+      parsedUrl = new URL(url);
+    } catch (error) {
+      reject(new Error('Invalid login URL after resolution: "' + url + '"'));
+      return;
+    }
+
+    try {
+      client = getNodeClient(parsedUrl.protocol);
+    } catch (error) {
+      reject(
+        new Error(
+          'Could not load the Node HTTP client inside Insomnia: ' +
+          error.message
+        )
+      );
+      return;
+    }
+
+    request = client.request(
+      {
+        protocol: parsedUrl.protocol,
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || undefined,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: options.method,
+        headers: options.headers
+      },
+      function (response) {
+        var chunks = [];
+
+        response.on('data', function (chunk) {
+          chunks.push(chunk);
+        });
+
+        response.on('end', function () {
+          resolve({
+            statusCode: response.statusCode || 0,
+            statusMessage: response.statusMessage || '',
+            headers: response.headers || {},
+            body: Buffer.concat(chunks).toString('utf8')
+          });
+        });
+      }
+    );
+
+    request.setTimeout(options.timeoutMs, function () {
+      request.destroy(
+        new Error('Login timed out after ' + options.timeoutMs + ' ms')
+      );
     });
 
-    refreshPromises.set(refreshKey, refreshPromise);
+    request.on('error', reject);
+
+    if (body !== null && body !== undefined) {
+      request.write(body);
+    }
+
+    request.end();
+  });
+}
+
+function buildLoginPayload(config) {
+  var payloadObject = {};
+
+  payloadObject[config.usernameField] = config.username;
+  payloadObject[config.passwordField] = config.password;
+
+  if (config.contentType === 'application/x-www-form-urlencoded') {
+    return {
+      body: Object.keys(payloadObject)
+        .map(function (key) {
+          return encodeURIComponent(key) +
+            '=' +
+            encodeURIComponent(payloadObject[key]);
+        })
+        .join('&'),
+      contentType: config.contentType
+    };
   }
 
-  return refreshPromises.get(refreshKey);
+  return {
+    body: JSON.stringify(payloadObject),
+    contentType: 'application/json'
+  };
+}
+
+function findCookie(headers, cookieName) {
+  var setCookieHeader = headers && headers['set-cookie'];
+  var values = Array.isArray(setCookieHeader)
+    ? setCookieHeader
+    : setCookieHeader
+      ? [setCookieHeader]
+      : [];
+  var index;
+  var rawCookie;
+  var cookiePair;
+  var separatorIndex;
+  var name;
+  var value;
+
+  for (index = 0; index < values.length; index += 1) {
+    rawCookie = String(values[index]);
+    cookiePair = rawCookie.split(';')[0].trim();
+    separatorIndex = cookiePair.indexOf('=');
+
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    name = cookiePair.slice(0, separatorIndex).trim();
+    value = cookiePair.slice(separatorIndex + 1);
+
+    if (name === cookieName) {
+      return {
+        name: name,
+        value: value,
+        raw: rawCookie
+      };
+    }
+  }
+
+  return null;
+}
+
+function calculateExpiry(rawSetCookie, fallbackTtlSeconds) {
+  var now = Date.now();
+  var maxAgeMatch = rawSetCookie.match(/(?:^|;\s*)Max-Age=(-?\d+)/i);
+  var expiresMatch;
+  var maxAgeSeconds;
+  var expiresAt;
+
+  if (maxAgeMatch) {
+    maxAgeSeconds = Number(maxAgeMatch[1]);
+
+    if (maxAgeSeconds <= 0) {
+      return now;
+    }
+
+    return now + maxAgeSeconds * 1000;
+  }
+
+  expiresMatch = rawSetCookie.match(/(?:^|;\s*)Expires=([^;]+)/i);
+
+  if (expiresMatch) {
+    expiresAt = Date.parse(expiresMatch[1]);
+
+    if (!Number.isNaN(expiresAt)) {
+      return expiresAt;
+    }
+  }
+
+  return now +
+    Math.max(1, Number(fallbackTtlSeconds) || DEFAULTS.fallbackTtlSeconds) *
+    1000;
+}
+
+function isFresh(cache, config) {
+  var now;
+  var expiryBufferMilliseconds;
+  var maxReuseMilliseconds;
+  var expiredByCookie;
+  var expiredByAge;
+
+  if (
+    !cache ||
+    !cache.value ||
+    !Number.isFinite(cache.expiresAt) ||
+    !Number.isFinite(cache.refreshedAt)
+  ) {
+    return false;
+  }
+
+  now = Date.now();
+  expiryBufferMilliseconds =
+    Math.max(0, Number(config.expiryBufferSeconds) || 0) * 1000;
+  maxReuseMilliseconds =
+    Math.max(1, Number(config.maxReuseSeconds) || DEFAULTS.maxReuseSeconds) *
+    1000;
+  expiredByCookie = now + expiryBufferMilliseconds >= cache.expiresAt;
+  expiredByAge = now - cache.refreshedAt >= maxReuseMilliseconds;
+
+  return !expiredByCookie && !expiredByAge;
+}
+
+function createCacheKey(loginUrl, username, cookieName) {
+  return CACHE_PREFIX +
+    encodeURIComponent(loginUrl + '|' + username + '|' + cookieName);
+}
+
+async function readCache(context, cacheKey) {
+  var store = getUsableStore(context);
+  var rawCache = await store.getItem(cacheKey);
+
+  if (!rawCache) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(rawCache);
+  } catch (error) {
+    await store.removeItem(cacheKey);
+    return null;
+  }
+}
+
+async function saveCache(context, cacheKey, cache) {
+  await getUsableStore(context).setItem(cacheKey, JSON.stringify(cache));
+}
+
+async function performLogin(context, cacheKey, config) {
+  var payload = buildLoginPayload(config);
+
+  var response = await requestRaw(
+    config.loginUrl,
+    {
+      method: 'POST',
+      timeoutMs: config.timeoutMs,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': payload.contentType,
+        'Content-Length': Buffer.byteLength(payload.body)
+      }
+    },
+    payload.body
+  );
+
+  var cookie;
+  var cachedCookie;
+
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(
+      'Login failed with HTTP ' +
+      response.statusCode +
+      ': ' +
+      response.body.slice(0, 500)
+    );
+  }
+
+  cookie = findCookie(response.headers, config.cookieName);
+
+  if (!cookie) {
+    throw new Error(
+      'Login returned HTTP ' +
+      response.statusCode +
+      ', but Set-Cookie did not contain "' +
+      config.cookieName +
+      '".'
+    );
+  }
+
+  cachedCookie = {
+    value: cookie.value,
+    expiresAt: calculateExpiry(cookie.raw, config.fallbackTtlSeconds),
+    refreshedAt: Date.now()
+  };
+
+  await saveCache(context, cacheKey, cachedCookie);
+  return cachedCookie;
+}
+
+async function getValidCookie(context, config) {
+  var cacheKey = createCacheKey(
+    config.loginUrl,
+    config.username,
+    config.cookieName
+  );
+  var cachedCookie = await readCache(context, cacheKey);
+  var loginPromise;
+
+  if (isFresh(cachedCookie, config)) {
+    return cachedCookie;
+  }
+
+  if (!refreshPromises[cacheKey]) {
+    loginPromise = performLogin(context, cacheKey, config).finally(
+      function () {
+        delete refreshPromises[cacheKey];
+      }
+    );
+
+    refreshPromises[cacheKey] = loginPromise;
+  }
+
+  return refreshPromises[cacheKey];
+}
+
+async function runAutoAuthCookie(
+  context,
+  baseUrlArgument,
+  loginPathArgument,
+  usernameArgument,
+  passwordArgument,
+  cookieNameArgument,
+  usernameFieldArgument,
+  passwordFieldArgument,
+  contentTypeArgument
+) {
+  var baseUrl;
+  var loginPath;
+  var username;
+  var password;
+  var cookieName;
+  var usernameField;
+  var passwordField;
+  var contentType;
+  var config;
+  var cookie;
+
+  baseUrl = resolveArgument(context, baseUrlArgument);
+  loginPath = resolveArgument(context, loginPathArgument);
+  username = resolveArgument(context, usernameArgument);
+  password = resolveArgument(context, passwordArgument);
+  cookieName = resolveArgument(context, cookieNameArgument);
+  usernameField = resolveArgument(context, usernameFieldArgument);
+  passwordField = resolveArgument(context, passwordFieldArgument);
+  contentType = resolveArgument(context, contentTypeArgument);
+
+  if (!hasValue(baseUrl)) {
+    throw new Error('Could not resolve Base URL from "' + baseUrlArgument + '".');
+  }
+
+  if (!hasValue(username)) {
+    throw new Error('Could not resolve Username from "' + usernameArgument + '".');
+  }
+
+  if (!hasValue(password)) {
+    throw new Error('Could not resolve Password from "' + passwordArgument + '".');
+  }
+
+  config = {
+    loginUrl: joinUrl(baseUrl, hasValue(loginPath) ? loginPath : DEFAULTS.loginPath),
+    username: String(username).trim(),
+    password: String(password),
+    cookieName: hasValue(cookieName) ? String(cookieName).trim() : DEFAULTS.cookieName,
+    usernameField: hasValue(usernameField)
+      ? String(usernameField).trim()
+      : DEFAULTS.usernameField,
+    passwordField: hasValue(passwordField)
+      ? String(passwordField).trim()
+      : DEFAULTS.passwordField,
+    contentType: hasValue(contentType)
+      ? String(contentType).trim()
+      : DEFAULTS.contentType,
+    fallbackTtlSeconds: DEFAULTS.fallbackTtlSeconds,
+    expiryBufferSeconds: DEFAULTS.expiryBufferSeconds,
+    maxReuseSeconds: DEFAULTS.maxReuseSeconds,
+    timeoutMs: DEFAULTS.timeoutMs
+  };
+
+  try {
+    cookie = await getValidCookie(context, config);
+    return cookie.value;
+  } catch (error) {
+    return 'AUTO_AUTH_COOKIE_ERROR: ' +
+      'Insomnia ' +
+      getAppVersion(context) +
+      '; Login URL=' +
+      config.loginUrl +
+      '; Cookie Name=' +
+      config.cookieName +
+      '; Cause=' +
+      (error && error.message ? error.message : String(error));
+  }
 }
 
 module.exports.templateTags = [
   {
     name: 'autoAuthCookieValue',
     displayName: 'Auto Auth Cookie Value',
-
     description:
-      'Return a valid cookie value. If the cookie is missing or expired, send the selected login request first.',
-
-    /*
-     * Prevent Insomnia from running login merely to display an editor
-     * preview. The tag still runs when the request is actually sent.
-     */
-    disablePreview: () => true,
-
+      'Logs in when required, caches the authentication cookie, and returns only the cookie value.',
+    disablePreview: function () {
+      return true;
+    },
     args: [
       {
-        displayName: 'Login Request',
-        type: 'model',
-        model: 'Request',
-        description:
-          'The saved Insomnia request that performs login and returns Set-Cookie.'
+        displayName: 'Base URL',
+        description: 'Literal URL or environment reference, for example _.baseURL',
+        type: 'string',
+        defaultValue: 'http://localhost:8080/'
       },
       {
-        displayName: 'Cookie Domain',
+        displayName: 'Login Path',
         type: 'string',
-        defaultValue: '',
-        placeholder: 'api.example.com',
-        description:
-          'Cookie domain without a path. A full URL is also accepted.'
+        defaultValue: DEFAULTS.loginPath
+      },
+      {
+        displayName: 'Username',
+        description: 'Literal username or environment reference',
+        type: 'string',
+        defaultValue: ''
+      },
+      {
+        displayName: 'Password',
+        description: 'Literal password or environment reference',
+        type: 'string',
+        defaultValue: ''
       },
       {
         displayName: 'Cookie Name',
         type: 'string',
-        defaultValue: 'authToken',
-        placeholder: 'authToken',
-        description:
-          'Name of the authentication cookie.'
+        defaultValue: DEFAULTS.cookieName
       },
       {
-        displayName: 'Expiry Buffer (seconds)',
-        type: 'number',
-        defaultValue: 30,
-        description:
-          'Refresh the cookie this many seconds before it expires.'
+        displayName: 'Username Field',
+        type: 'string',
+        defaultValue: DEFAULTS.usernameField
       },
       {
-        displayName: 'Show Debug Alerts',
-        type: 'boolean',
-        defaultValue: false,
-        description:
-          'Show visible Insomnia alerts when login is triggered and completed.'
+        displayName: 'Password Field',
+        type: 'string',
+        defaultValue: DEFAULTS.passwordField
+      },
+      {
+        displayName: 'Content Type',
+        type: 'enum',
+        defaultValue: DEFAULTS.contentType,
+        options: [
+          {
+            displayName: 'JSON',
+            value: 'application/json'
+          },
+          {
+            displayName: 'Form URL Encoded',
+            value: 'application/x-www-form-urlencoded'
+          }
+        ]
       }
     ],
-
-    async run(
-      context,
-      loginRequestId,
-      cookieDomain,
-      cookieName,
-      expiryBufferSeconds,
-      debugAlerts
-    ) {
-      validateContext(context);
-
-      if (!loginRequestId) {
-        throw new Error('A Login Request must be selected.');
-      }
-
-      if (!cookieDomain) {
-        throw new Error('Cookie Domain is required.');
-      }
-
-      if (!cookieName) {
-        throw new Error('Cookie Name is required.');
-      }
-
-      try {
-        const cookie = await getOrRefreshCookie(
-          context,
-          loginRequestId,
-          cookieDomain,
-          cookieName,
-          expiryBufferSeconds,
-          Boolean(debugAlerts)
-        );
-
-        return cookie.value;
-      } catch (error) {
-        await showDebugAlert(
-          context,
-          Boolean(debugAlerts),
-          `${PLUGIN_NAME} Error`,
-          error.message
-        );
-
-        throw error;
-      }
-    }
+    run: runAutoAuthCookie
   }
 ];
